@@ -8,6 +8,8 @@ CONF="/etc/presence/presence.conf"
 MQTT_CONF="/etc/presence/presence_mqtt.conf"
 DEV_CONF="/etc/presence/presence_devices.conf"
 
+HOST_ID="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo openwrt)"
+
 [ -f "$CONF" ] || exit 0
 [ -f "$MQTT_CONF" ] || exit 0
 [ -f "$DEV_CONF" ] || exit 0
@@ -16,6 +18,7 @@ DEV_CONF="/etc/presence/presence_devices.conf"
 . "$CONF"
 # shellcheck disable=SC1090
 . "$MQTT_CONF"
+PUB="mosquitto_pub -h $BROKER $AUTH -q 1"
 
 LOGTAG="presence_event"
 log() {
@@ -23,7 +26,44 @@ log() {
   logger -t "$LOGTAG" "$*"
 }
 
-HOST_ID="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo openwrt)"
+devices() {
+  awk '/^[[:space:]]*#/ { next } NF>=2 { print tolower($1), $2 }' "$DEV_CONF"
+}
+
+is_known() {
+  devices | awk -v m="$1" '$1 == tolower(m) { f=1 } END { exit !f }'
+}
+
+mac_id()   { echo "$1" | tr 'A-Z:' 'a-z-'; }            # b8-f4-a4-...
+mac_up()   { echo "$1" | tr 'a-z' 'A-Z'; }              # B8:F4:A4:...
+mac_flat() { echo "$1" | tr -d ':' | tr 'A-Z' 'a-z'; }  # b8f4a4...
+
+publish() {   # $1=mac  $2=connected|not_connected
+  log "publish topic='$TOPIC_PREFIX/station/$HOST_ID/$(mac_id "$1")/state' payload='$2'"
+  $PUB -r -t "$TOPIC_PREFIX/station/$HOST_ID/$(mac_id "$1")/state" -m "$2"
+}
+
+discovery() {
+  mac="$1"; name="$2"
+  log "discover device $mac"
+  id=$(mac_id "$mac"); flat=$(mac_flat "$mac"); up=$(mac_up "$mac")
+  $PUB -r \
+    -t "homeassistant/device_tracker/$HOST_ID/$id/config" \
+    -m "{
+\"name\":\"$name $HOST_ID\",
+\"unique_id\":\"wifipresence_${flat}_$HOST_ID\",
+\"default_entity_id\":\"device_tracker.${flat}_$HOST_ID\",
+\"source_type\":\"router\",
+\"state_topic\":\"$TOPIC_PREFIX/station/$HOST_ID/$id/state\",
+\"payload_home\":\"connected\",
+\"payload_not_home\":\"not_connected\",
+\"availability_topic\":\"$TOPIC_PREFIX/$HOST_ID/status\",
+\"payload_available\":\"online\",
+\"payload_not_available\":\"offline\",
+\"device\":{\"connections\":[[\"mac\",\"$up\"]],\"name\":\"$name\"}
+}"
+}
+
 STATE_DIR="/tmp/presence_state"
 mkdir -p "$STATE_DIR"
 
@@ -31,6 +71,41 @@ IFACE="${1:-}"
 EVENT="${2:-}"
 shift 2 || true
 REST="$*"
+
+# online status
+if [ "$EVENT" == status ] ; then
+  log "status thread"
+  {
+      echo online
+      sleep infinity &
+      SLEEPPID=$!
+      trap 'kill $SLEEPPID' TERM INT
+      wait $SLEEPPID
+      echo offline
+  } | $PUB -r -l -k 30 \
+          -t "$TOPIC_PREFIX/$HOST_ID/status" \
+          --will-topic "$TOPIC_PREFIX/$HOST_ID/status" \
+          --will-payload offline --will-retain --will-qos 1
+  exit 0
+# send device status on start
+elif [ "$EVENT" == sync ] ; then
+  connected=$(for i in $IFACE; do hostapd_cli -i "$i" all_sta; done \
+                | grep -Eio '^([0-9a-f]{2}:){5}[0-9a-f]{2}')
+  devices | while read -r mac name; do
+      log "sync device $mac"
+      if echo "$connected" | grep -qix "$mac"; then
+        publish "$mac" connected
+      else
+        publish "$mac" not_connected
+      fi
+  done
+  exit 0
+elif [ "$EVENT" == discover ] ; then
+  devices | while read -r mac name; do
+    discovery "$mac" "$name"
+  done
+  exit 0
+fi
 
 # Extract MAC with colons from the remaining args (hostapd_cli may append key=value tokens)
 MAC_RAW="$(printf '%s\n' "$REST" | grep -Eoi '([0-9a-f]{2}:){5}[0-9a-f]{2}' | head -n 1 || true)"
@@ -43,26 +118,10 @@ log "iface=$IFACE event=$EVENT rest='$REST' mac='$MAC'"
 
 STATE_FILE="$STATE_DIR/${MAC}.state"
 
-# Map MAC -> topic (case-insensitive)
-TOPIC="$(awk -v m="$MAC" '
-  BEGIN { mm=toupper(m) }
-  /^[[:space:]]*#/ { next }
-  NF>=2 {
-    if (toupper($1) == mm) { print $2; exit }
-  }
-' "$DEV_CONF")"
-
-log "mapped mac=$MAC -> topic='$TOPIC'"
-[ -n "$TOPIC" ] || exit 0
-
-# Enrich TOPIC with prefix
-[ -n "${TOPIC_PREFIX:-}" ] && TOPIC="${TOPIC_PREFIX%/}/$TOPIC"
-
-publish() {
-  payload="$1"
-  log "publish topic='$TOPIC' payload='$payload'"
-  mosquitto_pub     -h "$BROKER" -p "$PORT"     -u "$USER" -P "$PASS"     -i "ap-presence-$HOST_ID"     -q "${QOS:-1}" -r     --keepalive 30     --will-topic "${TOPIC}/status" --will-payload "unknown" --will-retain     -t "$TOPIC" -m "$payload" >/dev/null
-}
+if ! is_known $MAC ; then
+  log "unknown mac $MAC"
+  exit 0
+fi
 
 is_seen_anywhere() {
   # Roaming check across local radios on the same AP
@@ -78,7 +137,7 @@ case "$EVENT" in
   AP-STA-CONNECTED)
     # Cancel grace timer and publish home immediately
     rm -f "$STATE_FILE" 2>/dev/null || true
-    publish "home"
+    publish $MAC "home"
     ;;
 
   AP-STA-DISCONNECTED)
@@ -99,7 +158,7 @@ case "$EVENT" in
 
         log "grace expired for mac=$MAC -> publish not_home"
         rm -f "$STATE_FILE" 2>/dev/null || true
-        publish "not_home"
+        publish $MAC "not_home"
       fi
     ) &
 
